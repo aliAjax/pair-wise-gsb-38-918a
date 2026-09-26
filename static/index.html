@@ -1,17 +1,80 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>字幕本地化质检</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>影视字幕本地化质检</h1><p>示例项目已含术语表。分配翻译、时间轴和复核人员后，录入带时间点的字幕与评论，再完成提交、复核、锁定和交付。</p>
-<div class="card"><h2>身份与版本</h2><input id="user" value="alice"><select id="role"><option>owner</option><option>reviewer</option><option>translator</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button><pre id="data">等待刷新…</pre></div>
-<div class="card"><h2>录入字幕</h2><textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea><button onclick="saveCue()">保存字幕</button><pre id="cueResult"></pre></div>
-<div class="card"><h2>时间点评论</h2><input id="time" type="number" value="1200"><input id="comment" value="请复核这里的术语"><button onclick="addComment()">添加评论</button><pre id="commentResult"></pre></div>
-<div class="card"><h2>状态流转</h2><button onclick="action('submit')">提交复核</button><button onclick="review('approve')">复核通过</button><button onclick="review('reject')">退回修改</button><button onclick="action('lock')">锁定</button><button onclick="action('deliver')">交付</button><pre id="stateResult"></pre></div>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>字幕本地化质检 · 字幕工作台</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<h1>字幕工作台</h1>
+<nav><a href="/">字幕工作台</a><a href="/rework.html">评论返修</a><a href="/flow.html">状态流转</a></nav>
+<p>翻译/时间轴成员在此录入字幕并走版本状态机。评论的责任人登记、处理说明回复与确认关闭在
+  <a href="/rework.html">评论返修</a>页；状态事件在<a href="/flow.html">状态流转</a>页。</p>
+
+<div class="card">
+  <h2>身份与版本</h2>
+  <input id="user" value="alice">
+  <select id="role"><option>owner</option><option>reviewer</option><option>translator</option><option>timeline</option><option>admin</option></select>
+  <label>版本 ID <input id="version" type="number" value="1"></label>
+  <button onclick="refresh()">刷新</button>
+  <pre id="data">等待刷新…</pre>
+</div>
+
+<div class="card">
+  <h2>录入字幕</h2>
+  <textarea id="cue" rows="5">{"cue_index":1,"start_ms":1000,"end_ms":3000,"text":"海豹出现在冰面上","expected_revision":0}</textarea>
+  <button onclick="saveCue()">保存字幕</button>
+  <pre id="cueResult"></pre>
+  <small>保存会再次校验重叠、序号与术语；挂在该字幕上的已关闭/待确认意见会因此自动重新打开。</small>
+</div>
+
+<div class="card">
+  <h2>版本状态流转</h2>
+  <button onclick="action('submit')">提交复核</button>
+  <button onclick="review('approve')">复核通过</button>
+  <button class="danger" onclick="review('reject')">退回修改</button>
+  <button class="secondary" onclick="action('lock')">锁定</button>
+  <button class="secondary" onclick="action('deliver')">交付</button>
+  <pre id="stateResult"></pre>
+  <small>仍有未关闭或待确认的意见时，提交复核会被拒绝。</small>
+</div>
+
+<script src="/common.js"></script>
 <script>
-const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
-async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
-async function saveCue(){try{cueResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/cues',{method:'POST',headers:auth(),body:cue.value}),null,2)}catch(e){cueResult.textContent=e.message}}
-async function addComment(){try{commentResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/comments',{method:'POST',headers:auth(),body:JSON.stringify({time_ms:+time.value,body:comment.value})}),null,2)}catch(e){commentResult.textContent=e.message}}
-async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
-async function review(decision){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/review',{method:'POST',headers:auth(),body:JSON.stringify({decision,comment:''})}),null,2);refresh()}catch(e){stateResult.textContent=e.message}}
-async function refresh(){try{const [p,v,c,cm,d]=await Promise.all(['/api/projects','/api/versions','/api/versions/'+version.value+'/cues','/api/versions/'+version.value+'/comments','/api/deliveries'].map(call));data.textContent=JSON.stringify({p,v,c,cm,d},null,2)}catch(e){data.textContent=e.message}}
-</script></body></html>
+initIdentity();
+
+async function saveCue() {
+  try {
+    const r = await call("/api/versions/" + versionId() + "/cues",
+      { method: "POST", headers: headers(), body: cue.value });
+    show("cueResult", r);
+    refresh();
+  } catch (e) { show("cueResult", e.message); }
+}
+
+async function action(name) {
+  try {
+    show("stateResult", await call("/api/versions/" + versionId() + "/" + name,
+      { method: "POST", headers: headers(), body: "{}" }));
+    refresh();
+  } catch (e) { show("stateResult", e.message); }
+}
+
+async function review(decision) {
+  try {
+    show("stateResult", await call("/api/versions/" + versionId() + "/review",
+      { method: "POST", headers: headers(), body: JSON.stringify({ decision, comment: "" }) }));
+    refresh();
+  } catch (e) { show("stateResult", e.message); }
+}
+
+async function refresh() {
+  try {
+    const [p, v, c, d] = await Promise.all(
+      ["/api/projects", "/api/versions", "/api/versions/" + versionId() + "/cues", "/api/deliveries"].map(call));
+    show("data", { projects: p.projects, versions: v.versions, cues: c.cues, deliveries: d.deliveries });
+  } catch (e) { show("data", e.message); }
+}
+refresh();
+</script>
+</body></html>

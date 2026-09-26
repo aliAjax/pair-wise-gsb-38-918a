@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>字幕本地化质检 · 评论返修</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<h1>评论返修</h1>
+<nav><a href="/">字幕工作台</a><a href="/rework.html">评论返修</a><a href="/flow.html">状态流转</a></nav>
+<p>复核人提出意见后登记责任人与处理期限；翻译/时间轴成员回复处理说明进入待确认；
+复核人确认后才关闭，不认可可退回。关联字幕再次修改会自动重新打开。</p>
+
+<div class="card">
+  <h2>身份与版本</h2>
+  <input id="user" value="carol">
+  <select id="role"><option>reviewer</option><option>owner</option><option>translator</option><option>timeline</option><option>admin</option></select>
+  <label>版本 ID <input id="version" type="number" value="1"></label>
+  <button onclick="refresh()">刷新</button>
+  <span id="summary"></span>
+</div>
+
+<div class="card">
+  <h2>提出意见</h2>
+  <label>时间点 ms <input id="time" type="number" value="1200" style="width:110px"></label>
+  <label>字幕 ID（可空）<input id="cueId" type="number" style="width:110px"></label><br>
+  <input id="comment" value="请复核这里的术语" style="width:60%">
+  <button onclick="addComment()">添加评论</button>
+  <pre id="commentResult"></pre>
+</div>
+
+<div class="card">
+  <h2>意见与返修</h2>
+  <div id="comments">等待刷新…</div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+initIdentity();
+
+async function addComment() {
+  const payload = { time_ms: Number(time.value), body: comment.value };
+  if (cueId.value) payload.cue_id = Number(cueId.value);
+  try {
+    show("commentResult", await call("/api/versions/" + versionId() + "/comments",
+      { method: "POST", headers: headers(), body: JSON.stringify(payload) }));
+    refresh();
+  } catch (e) { show("commentResult", e.message); }
+}
+
+async function triage(id) {
+  const assignee = document.getElementById("assignee-" + id).value.trim();
+  const due_date = document.getElementById("due-" + id).value;
+  try {
+    await call(`/api/versions/${versionId()}/comments/${id}/triage`,
+      { method: "POST", headers: headers(), body: JSON.stringify({ assignee, due_date }) });
+    refresh();
+  } catch (e) { alert(e.message); }
+}
+
+async function reply(id) {
+  const note = document.getElementById("note-" + id).value.trim();
+  try {
+    await call(`/api/versions/${versionId()}/comments/${id}/reply`,
+      { method: "POST", headers: headers(), body: JSON.stringify({ note }) });
+    refresh();
+  } catch (e) { alert(e.message); }
+}
+
+async function confirmClose(id) {
+  try {
+    await call(`/api/versions/${versionId()}/comments/${id}/confirm`,
+      { method: "POST", headers: headers(), body: "{}" });
+    refresh();
+  } catch (e) { alert(e.message); }
+}
+
+async function sendBack(id) {
+  const reason = prompt("退回原因：");
+  if (!reason) return;
+  try {
+    await call(`/api/versions/${versionId()}/comments/${id}/return`,
+      { method: "POST", headers: headers(), body: JSON.stringify({ reason }) });
+    refresh();
+  } catch (e) { alert(e.message); }
+}
+
+function render(comments) {
+  if (!comments.length) return "<p>暂无评论。</p>";
+  return comments.map((c) => {
+    const replies = (c.replies || []).map((r) =>
+      `<div class="reply"><b>${esc(r.user)}</b> <small>${esc(r.created_at)}</small><br>${esc(r.note)}</div>`
+    ).join("");
+    let actions = "";
+    if (c.status === "open") {
+      actions = `
+        <div>登记：责任人 <input id="assignee-${c.id}" value="${esc(c.assignee || "")}" style="width:110px" placeholder="翻译/时间轴">
+        期限 <input id="due-${c.id}" type="date" value="${esc(c.due_date || "")}">
+        <button class="ghost" onclick="triage(${c.id})">登记责任人</button></div>
+        <div>回复：<input id="note-${c.id}" style="width:60%" placeholder="处理说明">
+        <button class="secondary" onclick="reply(${c.id})">提交处理说明</button></div>`;
+    } else if (c.status === "pending_confirmation") {
+      actions = `
+        <button onclick="confirmClose(${c.id})">确认关闭</button>
+        <button class="danger" onclick="sendBack(${c.id})">退回返修</button>`;
+    } else {
+      actions = `<small>已关闭；若关联字幕再次修改，会自动重新打开。</small>`;
+    }
+    return `<div class="comment">
+      <h4>#${c.id} ${badge(c.status)}</h4>
+      <div><b>${esc(c.user)}</b> <small>${esc(c.created_at)} · ${c.time_ms}ms${c.cue_id ? " · 字幕 #" + c.cue_id : ""}</small></div>
+      <div>${esc(c.body)}</div>
+      <div><small>责任人：${esc(c.assignee || "未登记")} ｜ 期限：${esc(c.due_date || "未登记")}</small></div>
+      ${replies}
+      <div style="margin-top:8px">${actions}</div>
+    </div>`;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const data = await call("/api/versions/" + versionId() + "/comments");
+    document.getElementById("comments").innerHTML = render(data.comments);
+    const open = data.comments.filter((c) => c.status !== "closed").length;
+    document.getElementById("summary").innerHTML = open
+      ? `<b style="color:#b8860b">有 ${open} 条未关闭/待确认意见，提交复核会被拒绝</b>`
+      : `<b style="color:#4a8a4a">意见已全部关闭，可以提交复核</b>`;
+  } catch (e) { document.getElementById("comments").textContent = e.message; }
+}
+refresh();
+</script>
+</body></html>

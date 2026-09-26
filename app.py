@@ -6,24 +6,18 @@ import hashlib
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import flow
+import records
+from core import DomainError, utcnow
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "subtitle_qc.db"
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.status = status
+STATIC_ROOT = ROOT / "static"
 
 
 class Database:
@@ -133,6 +127,8 @@ class Database:
                 );
                 """
             )
+            # 评论记录层的表与旧库迁移列。
+            records.install(conn)
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -231,11 +227,6 @@ class Database:
             raise DomainError("字幕版本不存在", 404)
         return row
 
-    def _can_edit(self, conn: sqlite3.Connection, version: sqlite3.Row, actor: str) -> bool:
-        if actor == version["owner"]:
-            return True
-        return bool(conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=? AND role IN ('translator','timeline')", (version["id"], actor)).fetchone())
-
     def _validate_glossary(self, conn: sqlite3.Connection, project_id: int, text: str) -> None:
         for row in conn.execute("SELECT * FROM glossaries WHERE project_id=?", (project_id,)):
             forbidden = json.loads(row["forbidden_terms"])
@@ -254,7 +245,7 @@ class Database:
             version = self._version(conn, version_id)
             if version["status"] != "draft":
                 raise DomainError("只有草稿版本可以修改字幕", 409)
-            if not self._can_edit(conn, version, actor):
+            if not flow.can_edit_cues(conn, version, actor):
                 raise DomainError("没有该版本的翻译或时间轴权限", 403)
             expected = payload.get("expected_revision")
             if expected is not None and int(expected) != int(version["revision"]):
@@ -290,10 +281,13 @@ class Database:
             else:
                 cur = conn.execute("INSERT INTO cues(version_id,cue_index,start_ms,end_ms,text,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)", (version_id, cue_index, start_ms, end_ms, text, actor, utcnow()))
                 saved_id = cur.lastrowid
+            # 挂在该字幕上的已关闭/待确认意见随字幕再次修改重新打开。
+            reopened = flow.reopen_for_cue(conn, version_id, saved_id, actor)
             revision = int(version["revision"]) + 1
             conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, utcnow(), version_id))
-            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision})
-        return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision}
+            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision, "reopened_comments": reopened})
+            cue_row = conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()
+        return dict(cue_row) | {"version_revision": revision, "reopened_comments": reopened}
 
     def add_comment(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         body = str(payload.get("body", "")).strip()
@@ -311,21 +305,56 @@ class Database:
             cue_id = payload.get("cue_id")
             if cue_id is not None and not conn.execute("SELECT 1 FROM cues WHERE id=? AND version_id=?", (int(cue_id), version_id)).fetchone():
                 raise DomainError("评论关联的字幕不存在", 404)
-            cur = conn.execute("INSERT INTO comments(version_id,cue_id,user,time_ms,body,created_at) VALUES(?,?,?,?,?,?)", (version_id, cue_id, actor, time_ms, body, utcnow()))
-            self._audit(conn, actor, "comment.added", "version", version_id, {"comment_id": cur.lastrowid, "time_ms": time_ms})
-        return {"id": int(cur.lastrowid), "version_id": version_id, "cue_id": cue_id, "user": actor, "time_ms": time_ms, "body": body, "status": "open"}
+            store = records.CommentStore(conn)
+            comment_id = store.insert(version_id, int(cue_id) if cue_id is not None else None, actor, time_ms, body)
+            self._audit(conn, actor, "comment.added", "version", version_id, {"comment_id": comment_id, "time_ms": time_ms})
+        return {"id": comment_id, "version_id": version_id, "cue_id": int(cue_id) if cue_id is not None else None,
+                "user": actor, "time_ms": time_ms, "body": body, "status": "open",
+                "assignee": None, "due_date": None}
+
+    # ---- 返修流程 ----
+    def _comment_action(self, version_id: int, comment_id: int, actor: str, role: str,
+                        payload: dict[str, Any], action_name: str) -> dict[str, Any]:
+        handlers = {
+            "triage": flow.triage_comment,
+            "reply": flow.reply_comment,
+            "confirm": flow.confirm_comment,
+            "return": flow.return_comment,
+        }
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = self._version(conn, version_id)
+            result = handlers[action_name](conn, version, comment_id, actor, payload)
+            self._audit(conn, actor, f"comment.{action_name}", "comment", comment_id,
+                        {"version_id": version_id, **{k: v for k, v in result.items() if k != "note"}})
+        return result
+
+    def triage_comment(self, version_id: int, comment_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        return self._comment_action(version_id, comment_id, actor, role, payload, "triage")
+
+    def reply_comment(self, version_id: int, comment_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        return self._comment_action(version_id, comment_id, actor, role, payload, "reply")
+
+    def confirm_comment(self, version_id: int, comment_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        return self._comment_action(version_id, comment_id, actor, role, payload, "confirm")
+
+    def return_comment(self, version_id: int, comment_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        return self._comment_action(version_id, comment_id, actor, role, payload, "return")
 
     def submit(self, version_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             version = self._version(conn, version_id)
-            if version["status"] != "draft" or not self._can_edit(conn, version, actor):
+            if version["status"] != "draft" or not flow.can_edit_cues(conn, version, actor):
                 raise DomainError("只有草稿版本的翻译或时间轴人员可以提交复核", 409)
             if not conn.execute("SELECT 1 FROM cues WHERE version_id=?", (version_id,)).fetchone():
                 raise DomainError("空版本不能提交复核", 409)
+            # 闸门：未关闭或待确认意见未清完，拒绝提交。
+            flow.assert_submittable(conn, version_id)
             conn.execute("UPDATE versions SET status='review',updated_at=? WHERE id=?", (utcnow(), version_id))
             self._audit(conn, actor, "version.submitted", "version", version_id, {})
-        return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
+            row = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+        return dict(row)
 
     def review(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         decision = str(payload.get("decision", "")).strip()
@@ -345,7 +374,8 @@ class Database:
             status = "approved" if decision == "approve" else "draft"
             conn.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?", (status, utcnow(), version_id))
             self._audit(conn, actor, f"version.{decision}", "version", version_id, {"comment": payload.get("comment", "")})
-        return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
+            row = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+        return dict(row)
 
     def lock(self, version_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
@@ -356,7 +386,8 @@ class Database:
                 raise DomainError("只有项目负责人可以锁定版本", 403)
             conn.execute("UPDATE versions SET status='locked',updated_at=? WHERE id=?", (utcnow(), version_id))
             self._audit(conn, actor, "version.locked", "version", version_id, {})
-        return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
+            row = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+        return dict(row)
 
     def deliver(self, version_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
@@ -381,7 +412,8 @@ class Database:
             )
             conn.execute("UPDATE versions SET status='delivered',updated_at=? WHERE id=?", (utcnow(), version_id))
             self._audit(conn, actor, "version.delivered", "version", version_id, {"snapshot_hash": snapshot_hash})
-        return dict(conn.execute("SELECT * FROM deliveries WHERE id=?", (cur.lastrowid,)).fetchone())
+            row = conn.execute("SELECT * FROM deliveries WHERE id=?", (cur.lastrowid,)).fetchone()
+        return dict(row)
 
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -400,8 +432,23 @@ class Database:
             return [dict(r) for r in conn.execute("SELECT * FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,)).fetchall()]
 
     def list_comments(self, version_id: int) -> list[dict[str, Any]]:
+        """评论记录：意见主体 + 处理说明回复；状态流转在独立接口查看。"""
         with self.connect() as conn:
-            return [dict(r) for r in conn.execute("SELECT * FROM comments WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
+            store = records.CommentStore(conn)
+            replies = store.replies_for(version_id)
+            result = []
+            for comment in store.list(version_id):
+                comment["status_label"] = records.STATUS_LABELS[comment["status"]]
+                comment["replies"] = replies.get(comment["id"], [])
+                result.append(comment)
+            return result
+
+    def list_comment_events(self, version_id: int) -> list[dict[str, Any]]:
+        """状态流转流水（与评论记录分开）。"""
+        with self.connect() as conn:
+            grouped = records.CommentStore(conn).events_for(version_id)
+            events = [event for bucket in grouped.values() for event in bucket]
+            return sorted(events, key=lambda e: e["id"])
 
     def list_deliveries(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -433,10 +480,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _html(self) -> None:
-        data = (ROOT / "static" / "index.html").read_bytes()
+    def _static(self, name: str) -> None:
+        # 页面与静态资源分开存放于 static/，只允许单段文件名。
+        if "/" in name or "\\" in name or name in {"", "."} or ".." in name:
+            raise DomainError("接口不存在", 404)
+        path = STATIC_ROOT / name
+        if not path.is_file():
+            raise DomainError("页面不存在", 404)
+        data = path.read_bytes()
+        content_types = {
+            ".html": "text/html; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+        }
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_types.get(path.suffix, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -457,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path in {"/", "/index.html"}:
-                return self._html()
+                return self._static("index.html")
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             if parsed.path == "/api/projects":
@@ -473,6 +531,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comment-events":
+                return self._send({"events": self.db.list_comment_events(int(parts[2]))})
+            if parts and parts[0] != "api":
+                return self._static(parsed.path.lstrip("/"))
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
@@ -495,6 +557,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.save_cue(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send(self.db.add_comment(int(parts[2]), actor, body, role), 201)
+            # /api/versions/{id}/comments/{cid}/triage|reply|confirm|return
+            if len(parts) == 6 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
+                version_id, comment_id, action_name = int(parts[2]), int(parts[4]), parts[5]
+                handlers = {
+                    "triage": self.db.triage_comment,
+                    "reply": self.db.reply_comment,
+                    "confirm": self.db.confirm_comment,
+                    "return": self.db.return_comment,
+                }
+                if action_name not in handlers:
+                    raise DomainError("接口不存在", 404)
+                return self._send(handlers[action_name](version_id, comment_id, actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "lock", "deliver"}:
                 version_id = int(parts[2])
                 if parts[3] == "submit":

@@ -1,0 +1,22 @@
+body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px;color:#1f2933}
+input,select,textarea,button{padding:7px;margin:3px;font:inherit}
+input,select,textarea{border:1px solid #c3ccd4;border-radius:6px}
+button{cursor:pointer;border:1px solid #3b6fb6;background:#3b6fb6;color:#fff;border-radius:6px;padding:7px 14px}
+button.secondary{background:#fff;color:#3b6fb6}
+button.danger{background:#b6483b;border-color:#b6483b}
+button.ghost{background:#eef2f6;color:#334;border-color:#c3ccd4}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box;border-radius:6px}
+nav a{margin-right:14px}
+small{color:#667}
+.comment{border:1px solid #d9e1e8;border-radius:8px;padding:12px;margin:10px 0}
+.comment h4{margin:0 0 6px}
+.badge{display:inline-block;border-radius:999px;padding:1px 10px;font-size:12px;color:#fff;margin-left:6px}
+.badge-open{background:#b8860b}
+.badge-pending_confirmation{background:#3b6fb6}
+.badge-closed{background:#4a8a4a}
+.reply{background:#eef4fb;border-radius:6px;padding:8px 10px;margin:6px 0}
+.event{border-left:3px solid #3b6fb6;padding:6px 10px;margin:8px 0;background:#f8fafc}
+.event .meta{color:#667;font-size:12px}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #dde3e9;padding:6px 9px;text-align:left;vertical-align:top}

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>字幕本地化质检 · 状态流转</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<h1>评论状态流转</h1>
+<nav><a href="/">字幕工作台</a><a href="/rework.html">评论返修</a><a href="/flow.html">状态流转</a></nav>
+<p>这里与评论记录分开，仅展示每条意见的状态事件流水：登记、回复、确认、退回与重新打开。</p>
+
+<div class="card">
+  <h2>身份与版本</h2>
+  <input id="user" value="carol">
+  <select id="role"><option>reviewer</option><option>owner</option><option>translator</option><option>timeline</option><option>admin</option></select>
+  <label>版本 ID <input id="version" type="number" value="1"></label>
+  <button onclick="refresh()">刷新</button>
+</div>
+
+<div class="card">
+  <h2>状态机</h2>
+  <pre>open ──登记责任人/期限──▶ open ──回复处理说明──▶ pending_confirmation ──复核人确认──▶ closed
+                                  ▲                         │
+                                  └──── 复核人退回 ──────────┘
+closed / pending_confirmation ──关联字幕再次修改──▶ open（自动重新打开）</pre>
+</div>
+
+<div class="card">
+  <h2>事件流水</h2>
+  <div id="events">等待刷新…</div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+initIdentity();
+
+async function refresh() {
+  try {
+    const data = await call("/api/versions/" + versionId() + "/comment-events");
+    if (!data.events.length) {
+      document.getElementById("events").textContent = "暂无状态事件。";
+      return;
+    }
+    document.getElementById("events").innerHTML = data.events.map((e) => {
+      const from = e.from_status ? STATUS_LABELS[e.from_status] + " → " : "（新建）→ ";
+      return `<div class="event">
+        <div><b>#${e.comment_id}</b> ${EVENT_LABELS[e.transition] || e.transition} ${badge(e.to_status)}</div>
+        <div class="meta">${esc(e.created_at)} · 操作人 ${esc(e.actor)} · ${esc(from)}${STATUS_LABELS[e.to_status] || e.to_status}</div>
+        <div><small>${esc(JSON.stringify(e.detail))}</small></div>
+      </div>`;
+    }).join("");
+  } catch (e) { document.getElementById("events").textContent = e.message; }
+}
+refresh();
+</script>
+</body></html>
