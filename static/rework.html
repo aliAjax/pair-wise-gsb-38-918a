@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>返修意见 - 字幕本地化质检</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,textarea,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre,textarea{background:#f5f7f9;padding:12px;overflow:auto;width:100%;box-sizing:border-box}button{cursor:pointer}small{color:#667}.tabs a{display:inline-block;margin-right:14px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #d9e1e8;padding:6px 9px;text-align:left;vertical-align:top}.st-open{color:#b54708;font-weight:600}.st-pending{color:#1d4ed8;font-weight:600}.st-closed{color:#15803d;font-weight:600}.overdue{color:#b91c1c;font-weight:700}.kind{font-size:12px;border:1px solid #b8c4d0;border-radius:4px;padding:0 5px;color:#445}</style></head>
+<body><h1>返修意见</h1><p>复核人登记责任人与处理期限；翻译/时间轴成员回复处理说明；复核人确认后意见才关闭，不通过可退回返修。挂在字幕上的意见关闭后，字幕再次修改会自动重新打开。</p>
+<div class="tabs"><strong>页面：</strong><a href="/">← 字幕与状态流转</a><a href="/rework.html">返修意见</a></div>
+<div class="card"><h2>身份与版本</h2><input id="user" value="carol"><select id="role"><option>reviewer</option><option>translator</option><option>timeline</option><option>owner</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新列表</button></div>
+
+<div class="card"><h2>登记返修意见（复核人）</h2>
+<label>时间点 ms <input id="fTime" type="number" value="1200"></label><label>字幕 ID（可留空） <input id="fCue" type="number" placeholder="如 1"></label><br>
+<label>责任人 <input id="fAssignee" value="bob"></label><label>处理期限 <input id="fDue" type="date"></label><br>
+<textarea id="fBody" rows="3">请复核这里的术语</textarea><br>
+<button onclick="register()">登记意见</button><pre id="registerResult"></pre></div>
+
+<div class="card"><h2>意见列表</h2><div id="list">等待刷新…</div></div>
+
+<div class="card"><h2>处理意见</h2>
+<label>意见 ID <input id="cid" type="number" min="1"></label><button onclick="loadDetail()">载入明细</button>
+<div id="detail" style="margin-top:10px">未载入</div>
+<h3>评论记录：回复处理说明（翻译/时间轴）</h3>
+<textarea id="replyNote" rows="3" placeholder="说明如何处理、改了什么"></textarea><br>
+<button onclick="doAction('reply')">提交回复（进入待确认）</button>
+<h3>状态流转：复核人确认 / 退回（退回必须写原因）</h3>
+<textarea id="reviewNote" rows="3" placeholder="确认时可留空；退回返修时必填"></textarea><br>
+<button onclick="doAction('confirm')">确认关闭</button><button onclick="doAction('rework')">退回返修</button>
+<pre id="actionResult"></pre></div>
+<script>
+const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
+async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const STATUS={open:'待处理',pending:'待确认',closed:'已关闭'};
+const KIND={register:'登记',reply:'回复',rework:'退回',note:'备注',system:'系统'};
+fDue.value=new Date(Date.now()+3*864e5).toISOString().slice(0,10);
+
+async function register(){
+  const payload={time_ms:+fTime.value,body:fBody.value,assignee:fAssignee.value,due_at:fDue.value};
+  if(fCue.value)payload.cue_id=+fCue.value;
+  try{registerResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/comments',{method:'POST',headers:auth(),body:JSON.stringify(payload)}),null,2);refresh()}
+  catch(e){registerResult.textContent=e.message}
+}
+async function refresh(){
+  try{
+    const {comments}=await call('/api/versions/'+version.value+'/comments');
+    if(!comments.length){list.innerHTML='<small>暂无意见</small>';return}
+    list.innerHTML='<table><tr><th>ID</th><th>状态</th><th>时间点</th><th>字幕</th><th>意见</th><th>责任人</th><th>期限</th><th>登记人</th></tr>'+
+      comments.map(c=>`<tr><td><a href="#" onclick="cid.value=${c.id};loadDetail();return false">${c.id}</a></td><td class="st-${c.status}">${STATUS[c.status]||c.status}</td><td>${c.time_ms}</td><td>${c.cue_id??'—'}</td><td>${esc(c.body)}</td><td>${esc(c.assignee)}</td><td>${esc(c.due_at)}${c.overdue?' <span class="overdue">已逾期</span>':''}</td><td>${esc(c.user)}</td></tr>`).join('')+'</table>';
+  }catch(e){list.textContent=e.message}
+}
+async function loadDetail(){
+  try{
+    const d=await call('/api/comments/'+cid.value);
+    const c=d.comment;
+    detail.innerHTML=`<p><strong>#${c.id}</strong> <span class="st-${c.status}">${STATUS[c.status]||c.status}</span> 责任人 ${esc(c.assignee)} 期限 ${esc(c.due_at)}${c.overdue?' <span class="overdue">已逾期</span>':''}</p>
+      <h3>评论记录</h3><table><tr><th>#</th><th>类型</th><th>成员</th><th>内容</th><th>时间</th></tr>${
+        d.records.map(r=>`<tr><td>${r.id}</td><td><span class="kind">${KIND[r.kind]||r.kind}</span></td><td>${esc(r.user)}</td><td>${esc(r.body)}</td><td><small>${esc(r.created_at)}</small></td></tr>`).join('')}</table>
+      <h3>状态流转</h3><table><tr><th>#</th><th>从</th><th>到</th><th>原因</th><th>操作人</th><th>时间</th></tr>${
+        d.transitions.map(t=>`<tr><td>${t.id}</td><td>${STATUS[t.from_status]||t.from_status||'—'}</td><td class="st-${t.to_status}">${STATUS[t.to_status]||t.to_status}</td><td>${esc(t.reason)}</td><td>${esc(t.user)}</td><td><small>${esc(t.created_at)}</small></td></tr>`).join('')}</table>`;
+    actionResult.textContent='';
+  }catch(e){detail.textContent=e.message}
+}
+async function doAction(kind){
+  const field=kind==='reply'?'replyNote':'reviewNote';
+  const key=kind==='rework'?'note':(kind==='reply'?'note':'note');
+  try{
+    actionResult.textContent=JSON.stringify(await call('/api/comments/'+cid.value+'/'+kind,{method:'POST',headers:auth(),body:JSON.stringify({[key]:document.getElementById(field).value})}),null,2);
+    loadDetail();refresh()
+  }catch(e){actionResult.textContent=e.message}
+}
+refresh();
+</script></body></html>

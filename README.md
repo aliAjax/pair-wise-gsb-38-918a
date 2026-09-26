@@ -16,10 +16,15 @@ python app.py --port 8009
 1. 负责人创建项目、字幕版本和术语规则。
 2. 为版本分配 `translator`、`timeline`、`reviewer`。
 3. 翻译或时间轴成员保存字幕；每项包含 `expected_revision`，旧页面提交会返回 409。
-4. 成员可对具体字幕或毫秒时间点添加评论。
-5. 翻译/时间轴成员提交复核，分配的非创建人复核人批准或退回。
-6. 负责人锁定已批准版本，再执行交付。
-7. 交付时生成确定性的 SHA-256 快照；同语言的新交付会把旧版本标记为 `superseded`，但旧快照不会删除或覆盖。
+4. 复核人对具体字幕或毫秒时间点登记返修意见，必须写明责任人与处理期限（状态 `open`）。
+5. 翻译/时间轴成员回复处理说明，意见转为 `pending`；复核人确认后才 `closed`，不通过可退回返修（重新 `open`）。
+6. 挂在字幕上的意见关闭后，该字幕再次被修改会自动重新打开意见。
+7. 仍有 `open` 或 `pending` 意见时，翻译/时间轴成员提交复核会被拒绝。
+8. 意见清零后提交复核，分配的非创建人复核人批准或退回。
+9. 负责人锁定已批准版本，再执行交付。
+10. 交付时生成确定性的 SHA-256 快照；同语言的新交付会把旧版本标记为 `superseded`，但旧快照不会删除或覆盖。
+
+评论记录（`comment_records`：登记/回复/退回/系统）与状态流转（`comment_transitions`：open→pending→closed 等）分表保存，页面也拆成字幕页 `/` 与返修页 `/rework.html`。
 
 字幕保存会验证时长范围、起点小于终点、字幕重叠、序号冲突和术语表。术语表中配置的禁用译法会直接阻止保存；指定译法可用。
 
@@ -31,10 +36,19 @@ python app.py --port 8009
 - `POST /api/projects/{id}/versions`：创建目标语言版本，可指定同语言父版本。
 - `POST /api/projects/{id}/glossary`：设置指定译法和禁用词。
 - `POST /api/versions/{id}/assignments`：分配角色。
-- `POST /api/versions/{id}/cues`：新增或修改字幕，要求 `expected_revision`。
-- `POST /api/versions/{id}/comments`：按具体时间毫秒或字幕 ID 评论。
-- `POST /api/versions/{id}/submit|review|lock|deliver`：完成审核交付状态机。
-- `GET /api/versions/{id}/cues|comments`、`GET /api/deliveries`：查看结果。
+- `POST /api/versions/{id}/cues`：新增或修改字幕，要求 `expected_revision`；修改已关闭意见关联的字幕会自动重开意见。
+- `POST /api/versions/{id}/comments`：复核人登记返修意见，字段 `time_ms`、`body`、`assignee`、`due_at`（`YYYY-MM-DD`），可选 `cue_id`。
+- `POST /api/comments/{id}/reply`：翻译/时间轴成员回复处理说明，意见进入待确认。
+- `POST /api/comments/{id}/confirm`：复核人确认关闭意见。
+- `POST /api/comments/{id}/rework`：复核人退回返修（`note` 必填），意见回到待处理。
+- `GET /api/comments/{id}`：意见明细，含分表的评论记录与状态流转。
+- `POST /api/versions/{id}/submit|review|lock|deliver`：完成审核交付状态机；存在未关闭/待确认意见时 `submit` 返回 409。
+- `GET /api/versions/{id}/cues|comments`、`GET /api/deliveries`：查看结果（评论带 `overdue` 逾期标记）。
+
+## 页面
+
+- `/`：字幕录入、版本状态流转。
+- `/rework.html`：返修意见登记、列表（状态/责任人/期限/逾期）、评论记录与状态流转发处理。
 
 ## 测试
 
@@ -42,4 +56,4 @@ python app.py --port 8009
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖完整复核交付流程、锁定覆盖保护、旧修订冲突、时间轴重叠、术语禁用和人员权限。
+测试覆盖完整复核交付流程、锁定覆盖保护、旧修订冲突、时间轴重叠、术语禁用、人员权限、返修状态机与评论记录、关闭意见随字幕修改重开、未清意见时拒绝提交和逾期标记。

@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -93,8 +93,30 @@ class Database:
                     time_ms INTEGER NOT NULL CHECK(time_ms >= 0),
                     body TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'open',
+                    assignee TEXT,
+                    due_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS comment_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('register','reply','rework','note','system')),
+                    user TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS comment_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+                    from_status TEXT,
+                    to_status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    user TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_comment_records ON comment_records(comment_id,id);
+                CREATE INDEX IF NOT EXISTS idx_comment_transitions ON comment_transitions(comment_id,id);
                 CREATE TABLE IF NOT EXISTS glossaries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -133,6 +155,14 @@ class Database:
                 );
                 """
             )
+            # Migrate databases created before comments became rework tickets.
+            existing = {r["name"] for r in conn.execute("SELECT name FROM pragma_table_info('comments')")}
+            if "assignee" not in existing:
+                conn.execute("ALTER TABLE comments ADD COLUMN assignee TEXT")
+            if "due_at" not in existing:
+                conn.execute("ALTER TABLE comments ADD COLUMN due_at TEXT")
+            if "updated_at" not in existing:
+                conn.execute("ALTER TABLE comments ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -236,6 +266,53 @@ class Database:
             return True
         return bool(conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=? AND role IN ('translator','timeline')", (version["id"], actor)).fetchone())
 
+    def _is_reviewer(self, conn: sqlite3.Connection, version: sqlite3.Row, actor: str) -> bool:
+        if actor == version["owner"]:
+            return True
+        return bool(conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=? AND role='reviewer'", (version["id"], actor)).fetchone())
+
+    def _parse_due_at(self, payload: dict[str, Any]) -> str:
+        due_at = str(payload.get("due_at", "")).strip()
+        if not due_at:
+            raise DomainError("复核人必须登记处理期限")
+        try:
+            date.fromisoformat(due_at)
+        except ValueError as exc:
+            raise DomainError("处理期限必须是 YYYY-MM-DD 日期") from exc
+        return due_at
+
+    def _comment(self, conn: sqlite3.Connection, comment_id: int) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT c.*,v.status AS version_status,v.created_by AS version_created_by,p.owner "
+            "FROM comments c JOIN versions v ON v.id=c.version_id JOIN projects p ON p.id=v.project_id WHERE c.id=?",
+            (comment_id,),
+        ).fetchone()
+        if not row:
+            raise DomainError("返修意见不存在", 404)
+        return row
+
+    def _add_record(self, conn: sqlite3.Connection, comment_id: int, kind: str, user: str, body: str) -> None:
+        conn.execute(
+            "INSERT INTO comment_records(comment_id,kind,user,body,created_at) VALUES(?,?,?,?,?)",
+            (comment_id, kind, user, body, utcnow()),
+        )
+
+    def _transition(self, conn: sqlite3.Connection, comment_id: int, from_status: str | None,
+                    to_status: str, user: str, reason: str = "") -> None:
+        conn.execute(
+            "INSERT INTO comment_transitions(comment_id,from_status,to_status,reason,user,created_at) VALUES(?,?,?,?,?,?)",
+            (comment_id, from_status, to_status, reason, user, utcnow()),
+        )
+
+    def _comment_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data.pop("version_status", None)
+        data.pop("version_created_by", None)
+        data.pop("owner", None)
+        overdue = bool(row["due_at"] and row["status"] != "closed" and row["due_at"] < date.today().isoformat())
+        data["overdue"] = overdue
+        return data
+
     def _validate_glossary(self, conn: sqlite3.Connection, project_id: int, text: str) -> None:
         for row in conn.execute("SELECT * FROM glossaries WHERE project_id=?", (project_id,)):
             forbidden = json.loads(row["forbidden_terms"])
@@ -292,28 +369,129 @@ class Database:
                 saved_id = cur.lastrowid
             revision = int(version["revision"]) + 1
             conn.execute("UPDATE versions SET revision=?,updated_at=? WHERE id=?", (revision, utcnow(), version_id))
-            self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision})
+            reopened = self._reopen_cue_comments(conn, saved_id, actor) if existing else []
+            self._audit(conn, actor, "cue.saved", "version", version_id,
+                        {"cue_id": saved_id, "revision": revision, "reopened_comments": reopened})
         return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision}
 
     def add_comment(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        """复核人登记一条返修意见：指定责任人与处理期限。"""
         body = str(payload.get("body", "")).strip()
         try:
             time_ms = int(payload.get("time_ms"))
         except (TypeError, ValueError) as exc:
             raise DomainError("评论时间必须是毫秒整数") from exc
+        assignee = str(payload.get("assignee", "")).strip()
+        if not assignee:
+            raise DomainError("复核人必须登记责任人")
+        due_at = self._parse_due_at(payload)
         with self.connect() as conn:
             version = self._version(conn, version_id)
-            allowed = actor == version["owner"] or conn.execute("SELECT 1 FROM assignments WHERE version_id=? AND user=?", (version_id, actor)).fetchone()
-            if not allowed:
-                raise DomainError("只有项目成员可以评论", 403)
+            if version["status"] in {"locked", "delivered", "superseded"}:
+                raise DomainError("版本已锁定或交付，不能再登记意见", 409)
+            if not self._is_reviewer(conn, version, actor):
+                raise DomainError("只有复核人可以登记返修意见", 403)
             if not body or time_ms < 0 or time_ms > int(version["duration_ms"]):
                 raise DomainError("评论内容或时间点不合法")
             cue_id = payload.get("cue_id")
             if cue_id is not None and not conn.execute("SELECT 1 FROM cues WHERE id=? AND version_id=?", (int(cue_id), version_id)).fetchone():
                 raise DomainError("评论关联的字幕不存在", 404)
-            cur = conn.execute("INSERT INTO comments(version_id,cue_id,user,time_ms,body,created_at) VALUES(?,?,?,?,?,?)", (version_id, cue_id, actor, time_ms, body, utcnow()))
-            self._audit(conn, actor, "comment.added", "version", version_id, {"comment_id": cur.lastrowid, "time_ms": time_ms})
-        return {"id": int(cur.lastrowid), "version_id": version_id, "cue_id": cue_id, "user": actor, "time_ms": time_ms, "body": body, "status": "open"}
+            now = utcnow()
+            cur = conn.execute(
+                "INSERT INTO comments(version_id,cue_id,user,time_ms,body,status,assignee,due_at,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (version_id, cue_id, actor, time_ms, body, "open", assignee, due_at, now, now),
+            )
+            comment_id = int(cur.lastrowid)
+            self._add_record(conn, comment_id, "register", actor, body)
+            self._transition(conn, comment_id, None, "open", actor, f"责任人 {assignee}；期限 {due_at}")
+            self._audit(conn, actor, "comment.registered", "comment", comment_id,
+                        {"version_id": version_id, "cue_id": cue_id, "assignee": assignee, "due_at": due_at})
+        with self.connect() as conn:
+            return self._comment_payload(self._comment(conn, comment_id))
+
+    def reply_comment(self, comment_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        """责任人（翻译/时间轴权限）回复处理说明，意见进入待确认。"""
+        note = str(payload.get("note", payload.get("body", ""))).strip()
+        if not note:
+            raise DomainError("处理说明不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            comment = self._comment(conn, comment_id)
+            if comment["version_status"] in {"locked", "delivered", "superseded"}:
+                raise DomainError("版本已锁定或交付，不能再回复意见", 409)
+            if not self._can_edit(conn, {"id": comment["version_id"], "owner": comment["owner"]}, actor):
+                raise DomainError("只有该版本的翻译或时间轴成员可以回复", 403)
+            if comment["status"] not in {"open", "pending"}:
+                raise DomainError("只有未关闭的意见可以回复", 409)
+            self._add_record(conn, comment_id, "reply", actor, note)
+            if comment["status"] == "open":
+                conn.execute("UPDATE comments SET status='pending',updated_at=? WHERE id=?", (utcnow(), comment_id))
+                self._transition(conn, comment_id, "open", "pending", actor, note)
+            self._audit(conn, actor, "comment.replied", "comment", comment_id, {"note": note})
+        with self.connect() as conn:
+            return self._comment_payload(self._comment(conn, comment_id))
+
+    def confirm_comment(self, comment_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        """复核人确认处理结果并关闭意见。"""
+        note = str(payload.get("note", "")).strip()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            comment = self._comment(conn, comment_id)
+            if not self._is_reviewer(conn, {"id": comment["version_id"], "owner": comment["owner"]}, actor):
+                raise DomainError("只有复核人可以确认意见", 403)
+            if comment["status"] != "pending":
+                raise DomainError("只有待确认的意见可以确认关闭", 409)
+            if note:
+                self._add_record(conn, comment_id, "note", actor, note)
+            conn.execute("UPDATE comments SET status='closed',updated_at=? WHERE id=?", (utcnow(), comment_id))
+            self._transition(conn, comment_id, "pending", "closed", actor, note or "复核人确认关闭")
+            self._audit(conn, actor, "comment.confirmed", "comment", comment_id, {"note": note})
+        with self.connect() as conn:
+            return self._comment_payload(self._comment(conn, comment_id))
+
+    def rework_comment(self, comment_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        """复核人认为处理不充分，退回责任人返修。"""
+        note = str(payload.get("note", payload.get("body", ""))).strip()
+        if not note:
+            raise DomainError("退回返修必须写明原因")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            comment = self._comment(conn, comment_id)
+            if comment["version_status"] in {"locked", "delivered", "superseded"}:
+                raise DomainError("版本已锁定或交付，不能再退回意见", 409)
+            if not self._is_reviewer(conn, {"id": comment["version_id"], "owner": comment["owner"]}, actor):
+                raise DomainError("只有复核人可以退回返修", 403)
+            if comment["status"] != "pending":
+                raise DomainError("只有待确认的意见可以退回返修", 409)
+            self._add_record(conn, comment_id, "rework", actor, note)
+            conn.execute("UPDATE comments SET status='open',updated_at=? WHERE id=?", (utcnow(), comment_id))
+            self._transition(conn, comment_id, "pending", "open", actor, note)
+            self._audit(conn, actor, "comment.rework", "comment", comment_id, {"note": note})
+        with self.connect() as conn:
+            return self._comment_payload(self._comment(conn, comment_id))
+
+    def _reopen_cue_comments(self, conn: sqlite3.Connection, cue_id: int, actor: str) -> list[int]:
+        """挂在字幕上且已关闭的意见，在字幕再次修改时重新打开。"""
+        reopened: list[int] = []
+        rows = conn.execute(
+            "SELECT id FROM comments WHERE cue_id=? AND status='closed'", (cue_id,)
+        ).fetchall()
+        for row in rows:
+            comment_id = int(row["id"])
+            conn.execute("UPDATE comments SET status='open',updated_at=? WHERE id=?", (utcnow(), comment_id))
+            self._add_record(conn, comment_id, "system", actor, "关联字幕再次修改，意见自动重新打开")
+            self._transition(conn, comment_id, "closed", "open", actor, "字幕修改自动重开")
+            self._audit(conn, actor, "comment.reopened", "comment", comment_id, {"cue_id": cue_id})
+            reopened.append(comment_id)
+        return reopened
+
+    def get_comment(self, comment_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            comment = self._comment_payload(self._comment(conn, comment_id))
+            records = [dict(r) for r in conn.execute("SELECT * FROM comment_records WHERE comment_id=? ORDER BY id", (comment_id,))]
+            transitions = [dict(r) for r in conn.execute("SELECT * FROM comment_transitions WHERE comment_id=? ORDER BY id", (comment_id,))]
+        return {"comment": comment, "records": records, "transitions": transitions}
 
     def submit(self, version_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
@@ -323,6 +501,12 @@ class Database:
                 raise DomainError("只有草稿版本的翻译或时间轴人员可以提交复核", 409)
             if not conn.execute("SELECT 1 FROM cues WHERE version_id=?", (version_id,)).fetchone():
                 raise DomainError("空版本不能提交复核", 409)
+            pending_comments = conn.execute(
+                "SELECT COUNT(*) c FROM comments WHERE version_id=? AND status IN ('open','pending')",
+                (version_id,),
+            ).fetchone()["c"]
+            if pending_comments:
+                raise DomainError(f"还有 {pending_comments} 条未关闭或待确认的意见，不能提交复核", 409)
             conn.execute("UPDATE versions SET status='review',updated_at=? WHERE id=?", (utcnow(), version_id))
             self._audit(conn, actor, "version.submitted", "version", version_id, {})
         return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
@@ -401,7 +585,13 @@ class Database:
 
     def list_comments(self, version_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            return [dict(r) for r in conn.execute("SELECT * FROM comments WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
+            rows = conn.execute(
+                "SELECT c.*,v.status AS version_status,v.created_by AS version_created_by,p.owner "
+                "FROM comments c JOIN versions v ON v.id=c.version_id JOIN projects p ON p.id=v.project_id "
+                "WHERE c.version_id=? ORDER BY c.id",
+                (version_id,),
+            ).fetchall()
+            return [self._comment_payload(r) for r in rows]
 
     def list_deliveries(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -433,8 +623,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _html(self) -> None:
-        data = (ROOT / "static" / "index.html").read_bytes()
+    def _html(self, name: str = "index.html") -> None:
+        data = (ROOT / "static" / name).read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -457,7 +647,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path in {"/", "/index.html"}:
-                return self._html()
+                return self._html("index.html")
+            if parsed.path == "/rework.html":
+                return self._html("rework.html")
             if parsed.path == "/api/health":
                 return self._send({"ok": True})
             if parsed.path == "/api/projects":
@@ -469,6 +661,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
             parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "comments"]:
+                return self._send(self.db.get_comment(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "cues":
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
@@ -495,6 +689,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.save_cue(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send(self.db.add_comment(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "comments"] and parts[3] in {"reply", "confirm", "rework"}:
+                comment_id = int(parts[2])
+                if parts[3] == "reply":
+                    return self._send(self.db.reply_comment(comment_id, actor, body, role))
+                if parts[3] == "confirm":
+                    return self._send(self.db.confirm_comment(comment_id, actor, body, role))
+                return self._send(self.db.rework_comment(comment_id, actor, body, role))
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "lock", "deliver"}:
                 version_id = int(parts[2])
                 if parts[3] == "submit":
